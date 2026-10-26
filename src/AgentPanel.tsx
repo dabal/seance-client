@@ -6,6 +6,8 @@ interface BridgeInfo {
   endpoint: string;
   mode: ConsentMode;
   allow: string[];
+  /// auto-approval also covers tabs the operator isn't viewing
+  all_tabs: boolean;
 }
 
 type ConsentMode = "ask" | "allowlist" | "autonomous";
@@ -39,6 +41,9 @@ interface SessionRef {
 interface AgentPanelProps {
   sessions: SessionRef[];
   activeId: number | null;
+  /// which tab the agent drives (null = follow the active tab); owned by App
+  pinned: number | null;
+  onPinChange: (id: number | null) => void;
 }
 
 // keep the feed bounded — this is a live view, not the audit log
@@ -55,10 +60,15 @@ const AGENT_TOOLS = [
   ["list_tabs", "List tabs"],
   ["switch_tab", "Switch target tab"],
   ["list_saved_hosts", "List saved hosts"],
+  ["open_saved_host", "Open saved host"],
 ] as const;
-// open_saved_host is deliberately absent: the backend always asks for it
 
-export default function AgentPanel({ sessions, activeId }: AgentPanelProps) {
+export default function AgentPanel({
+  sessions,
+  activeId,
+  pinned,
+  onPinChange,
+}: AgentPanelProps) {
   const [open, setOpen] = useState(false);
   const [info, setInfo] = useState<BridgeInfo | null>(null);
   const [mode, setMode] = useState<ConsentMode>("ask");
@@ -66,9 +76,8 @@ export default function AgentPanel({ sessions, activeId }: AgentPanelProps) {
   const [activity, setActivity] = useState<Activity[]>([]);
   const [pending, setPending] = useState<ConsentRequest[]>([]);
   const [copied, setCopied] = useState("");
-  // which tab the agent drives (null = follow the active tab)
-  const [pinned, setPinned] = useState<number | null>(null);
   const [acceptedBg, setAcceptedBg] = useState(false);
+  const [allTabs, setAllTabs] = useState(false);
 
   useEffect(() => {
     invoke<BridgeInfo>("agent_bridge_info")
@@ -76,29 +85,27 @@ export default function AgentPanel({ sessions, activeId }: AgentPanelProps) {
         setInfo(i);
         setMode(i.mode); // reflect the persisted policy, not a hardcoded default
         setAllowList(i.allow);
+        setAllTabs(i.all_tabs);
       })
       .catch(() => {});
   }, []);
 
-  // drop a pin if its tab closed
+  // a new target needs a fresh background acknowledgement (the backend also
+  // drops its copy when the agent retargets itself)
   useEffect(() => {
-    if (pinned != null && !sessions.some((s) => s.id === pinned)) {
-      setPinned(null);
-      invoke("set_pinned", { id: null }).catch(() => {});
-    }
-  }, [sessions, pinned]);
-
-  const changePin = useCallback((id: number | null) => {
-    setPinned(id);
     setAcceptedBg(false);
-    invoke("set_pinned", { id }).catch(() => {});
-  }, []);
+  }, [pinned]);
 
   // The agent drives the pinned tab (or the active tab if unpinned). It's a
   // "background" action when that tab isn't the one being viewed.
   const effectiveTab = pinned ?? activeId;
   const isBackground = effectiveTab != null && effectiveTab !== activeId;
-  const needsBgAck = mode === "autonomous" && isBackground && !acceptedBg;
+  const needsBgAck = mode === "autonomous" && isBackground && !acceptedBg && !allTabs;
+
+  const changeAllTabs = useCallback((on: boolean) => {
+    setAllTabs(on);
+    invoke("agent_set_background_autonomy", { enabled: on }).catch(() => {});
+  }, []);
 
   const acceptBackground = useCallback(() => {
     setAcceptedBg(true);
@@ -112,11 +119,6 @@ export default function AgentPanel({ sessions, activeId }: AgentPanelProps) {
       }),
       listen<ConsentRequest>("agent-consent-request", (e) => {
         setPending((p) => [...p, e.payload]);
-      }),
-      // the agent retargeted itself (switch_tab / open_saved_host)
-      listen<{ id: number }>("agent-pinned", (e) => {
-        setPinned(e.payload.id);
-        setAcceptedBg(false);
       }),
     ];
     return () => subs.forEach((s) => s.then((f) => f()));
@@ -239,17 +241,24 @@ export default function AgentPanel({ sessions, activeId }: AgentPanelProps) {
           <div className="agent-section">
             <h4>Target tab</h4>
             <p className="agent-hint">
-              Which session the agent drives. Pin one, or follow whichever tab
-              you're viewing. The agent can also switch this itself, and open
-              saved hosts (always with your approval).
+              Which session the agent drives. Any lets it pick and open tabs
+              itself; pin one, or follow whichever tab you're viewing.
             </p>
             <select
               className="agent-select"
-              value={pinned ?? ""}
-              onChange={(e) =>
-                changePin(e.target.value === "" ? null : Number(e.target.value))
-              }
+              value={allTabs ? "any" : pinned ?? ""}
+              onChange={(e) => {
+                const v = e.target.value;
+                if (v === "any") {
+                  // the agent keeps whatever tab it targets now
+                  changeAllTabs(true);
+                  return;
+                }
+                if (allTabs) changeAllTabs(false);
+                onPinChange(v === "" ? null : Number(v));
+              }}
             >
+              <option value="any">Any tab (agent chooses, until restart)</option>
               <option value="">Follow active tab</option>
               {sessions.map((s) => (
                 <option key={s.id} value={s.id}>
@@ -257,7 +266,7 @@ export default function AgentPanel({ sessions, activeId }: AgentPanelProps) {
                 </option>
               ))}
             </select>
-            {isBackground && (
+            {isBackground && !allTabs && (
               <p className="agent-hint">
                 Pinned to a tab you're not viewing — the agent acts in the
                 background. Per-call prompts still show what it's doing.
@@ -284,7 +293,7 @@ export default function AgentPanel({ sessions, activeId }: AgentPanelProps) {
                 </label>
               ))}
             </div>
-            {mode === "autonomous" && !isBackground && (
+            {mode === "autonomous" && (!isBackground || allTabs) && (
               <p className="agent-warn">
                 Every tool call runs without asking. Watch the activity feed.
               </p>

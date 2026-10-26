@@ -155,6 +155,10 @@ interface SavedHost {
 export default function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [activeId, setActiveId] = useState<number | null>(null);
+  // the tab the Agent Bridge is pinned to (null = it follows the active tab).
+  // Lives here, not in AgentPanel, because the tab bar marks it and the panel
+  // unmounts while the connection form is showing.
+  const [agentPinned, setAgentPinned] = useState<number | null>(null);
   const [adding, setAdding] = useState(false);
   const [connecting, setConnecting] = useState(false);
 
@@ -344,6 +348,10 @@ export default function App() {
           },
         ]);
         showToast(`Agent opened ${info.name || host}`);
+      }),
+      // the agent retargeted itself (switch_tab / open_saved_host)
+      listen<{ id: number }>("agent-pinned", (e) => {
+        setAgentPinned(e.payload.id);
       }),
       listen("rfb-cut-text", () => {
         showToast("Remote clipboard copied");
@@ -570,6 +578,18 @@ export default function App() {
     }
   }, [sessions, activeId]);
 
+  const changeAgentPin = useCallback((id: number | null) => {
+    setAgentPinned(id);
+    invoke("set_pinned", { id }).catch(() => {});
+  }, []);
+
+  // drop the agent's pin if its tab closed
+  useEffect(() => {
+    if (agentPinned != null && !sessions.some((s) => s.id === agentPinned)) {
+      changeAgentPin(null);
+    }
+  }, [sessions, agentPinned, changeAgentPin]);
+
   const selectTab = useCallback((id: number) => {
     setActiveId(id);
     setAdding(false); // clicking a tab also leaves the "new connection" form
@@ -692,6 +712,12 @@ export default function App() {
               title={`${s.host} — ${s.name}`}
             >
               <span className="tab-label">{s.name || s.host}</span>
+              {/* only when pinned: following the active tab can't split views */}
+              {s.id === agentPinned && (
+                <span className="tab-agent" title="The Agent Bridge acts on this tab">
+                  agent
+                </span>
+              )}
               <button
                 className="tab-close"
                 onClick={(e) => {
@@ -736,7 +762,12 @@ export default function App() {
             <button className="btn" onClick={sendCtrlAltDel}>
               Ctrl+Alt+Del
             </button>
-            <AgentPanel sessions={sessions} activeId={activeId} />
+            <AgentPanel
+              sessions={sessions}
+              activeId={activeId}
+              pinned={agentPinned}
+              onPinChange={changeAgentPin}
+            />
             <button className="btn btn-danger" onClick={() => closeTab(activeSession.id)}>
               Disconnect
             </button>

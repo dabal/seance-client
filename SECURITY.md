@@ -60,7 +60,8 @@ Required properties:
 - Tool calls are scoped to the active or explicitly pinned session. The agent
   may retarget among open tabs (`switch_tab`) without moving the operator's
   view, and may open a new tab only to an operator-saved host
-  (`open_saved_host`). Opening is ask-only in every consent mode, and stored
+  (`open_saved_host`). Opening follows the consent policy like any other tool
+  (it auto-approves in autonomous mode or when allow-listed), and stored
   credentials go from the OS credential store to the handshake without
   reaching the agent or the renderer.
 - An agent-initiated retarget clears any background-tab acknowledgement; the
@@ -70,7 +71,9 @@ Required properties:
   current session posture.
 - Autonomous permission must not silently persist across app restarts.
 - Background actions require backend-enforced acknowledgement when the operator
-  is not watching the target tab.
+  is not watching the target tab: either a 15-minute acknowledgement, or the
+  explicit "Any tab" target setting. That setting is audited when
+  turned on or off, and does not persist across restarts.
 - Every tool call emits live activity and an audit entry.
 - Sensitive free-text arguments are redacted before they hit the audit log.
 - Audit entries are hash-chained so tampering is detectable.

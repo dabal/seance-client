@@ -382,6 +382,7 @@ fn agent_bridge_info(bridge: State<'_, agent::AgentBridge>) -> serde_json::Value
         "endpoint": bridge.endpoint(),
         "mode": mode,
         "allow": allow,
+        "all_tabs": bridge.background_autonomy(),
     })
 }
 
@@ -570,6 +571,13 @@ fn agent_accept_background(bridge: State<'_, agent::AgentBridge>) {
     bridge.accept_background();
 }
 
+/// Operator setting: auto-approved agent calls also run on tabs they aren't
+/// viewing. Deliberately not persisted — re-armed each launch, like autonomous.
+#[tauri::command]
+fn agent_set_background_autonomy(bridge: State<'_, agent::AgentBridge>, enabled: bool) {
+    bridge.set_background_autonomy(enabled);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -612,6 +620,7 @@ pub fn run() {
             agent_set_consent,
             agent_consent_respond,
             agent_accept_background,
+            agent_set_background_autonomy,
             connect,
             connect_stored,
             disconnect,

@@ -21,8 +21,8 @@
 //!     (timestamp, agent, tool, args, decision, result).
 //!   - **Session scoping.** Screen and input tools reach only the pinned (or
 //!     active) tab. The agent may retarget among open tabs, and may open a new
-//!     tab only to a host the operator saved — always ask-only, with stored
-//!     credentials that never leave Rust.
+//!     tab only to a host the operator saved, with stored credentials that
+//!     never leave Rust.
 
 mod keys;
 
@@ -32,7 +32,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -143,6 +143,9 @@ struct Inner {
     /// Expiry of the operator's acknowledgement for autonomous actions on a
     /// background (unwatched) tab. Enforced in `decide`, not just the UI.
     bg_ack_until: Mutex<Option<std::time::Instant>>,
+    /// Operator setting: auto-approval also covers tabs they aren't viewing —
+    /// no expiry, survives agent retargets. Session-only, like autonomous.
+    bg_all: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -180,6 +183,7 @@ impl AgentBridge {
             audit_tip: Mutex::new(audit_tip),
             rate: Mutex::new(RateLimit::default()),
             bg_ack_until: Mutex::new(None),
+            bg_all: AtomicBool::new(false),
         }));
 
         // dev affordance: surface the local endpoint + token so a developer can
@@ -260,6 +264,22 @@ impl AgentBridge {
         self.audit_note(
             "operator accepted responsibility: autonomous agent actions on a pinned background tab (15m)",
         );
+    }
+
+    /// Let auto-approved calls (autonomous / allow-list) run on every tab, not
+    /// just the one being viewed. Turning it on *is* the operator's standing
+    /// acknowledgement, so both directions are audited.
+    pub fn set_background_autonomy(&self, on: bool) {
+        self.0.bg_all.store(on, Ordering::SeqCst);
+        self.audit_note(if on {
+            "operator allowed auto-approved agent actions on all tabs, including tabs not being viewed"
+        } else {
+            "operator limited auto-approved agent actions to the viewed tab"
+        });
+    }
+
+    pub fn background_autonomy(&self) -> bool {
+        self.0.bg_all.load(Ordering::SeqCst)
     }
 
     fn bg_ack_valid(&self) -> bool {
@@ -505,10 +525,6 @@ impl AgentBridge {
         background: bool,
         detail: Option<&str>,
     ) -> bool {
-        // Ask-only tools widen what the agent can reach; no policy pre-approves them.
-        if ASK_ONLY_TOOLS.contains(&tool) {
-            return self.ask(tool, tab, detail).await;
-        }
         let auto = match &*self.0.consent.lock().unwrap() {
             ConsentMode::Autonomous => true,
             ConsentMode::AllowList(set) => set.contains(tool),
@@ -516,9 +532,10 @@ impl AgentBridge {
         };
         if auto {
             // Never auto-approve an action on a tab the operator isn't watching
-            // without a live, backend-held acknowledgement — even in autonomous
-            // or allow-list mode. Otherwise fall through to an explicit prompt.
-            if background && !self.bg_ack_valid() {
+            // without a backend-held acknowledgement — a live 15-minute one, or
+            // the standing all-tabs setting — even in autonomous or allow-list
+            // mode. Otherwise fall through to an explicit prompt.
+            if background && !self.bg_ack_valid() && !self.background_autonomy() {
                 return self.ask(tool, tab, detail).await;
             }
             return true;
@@ -928,7 +945,7 @@ fn tool_specs() -> Value {
         },
         {
             "name": "open_saved_host",
-            "description": "Connect to a saved host in a new background tab using its stored credentials, and make it the agent's target. If it is already open, retargets to that tab. Always requires operator approval.",
+            "description": "Connect to a saved host in a new background tab using its stored credentials, and make it the agent's target. If it is already open, retargets to that tab.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -948,10 +965,6 @@ fn is_tab_tool(name: &str) -> bool {
         "list_tabs" | "switch_tab" | "list_saved_hosts" | "open_saved_host"
     )
 }
-
-/// Tools no consent policy auto-approves: opening a connection widens what the
-/// agent can reach, so the operator decides each time.
-const ASK_ONLY_TOOLS: &[&str] = &["open_saved_host"];
 
 /// Resolve a saved host by name or address (case-insensitive), optionally
 /// narrowed by group. Ambiguity is an error, never a guess.
@@ -1187,12 +1200,6 @@ mod tests {
             "10.0.0.3"
         );
         assert!(find_saved_host(&hosts, "nope", None).is_err());
-    }
-
-    #[test]
-    fn open_saved_host_is_never_auto_approved() {
-        assert!(ASK_ONLY_TOOLS.contains(&"open_saved_host"));
-        assert!(is_tab_tool("open_saved_host"));
     }
 
     #[test]
