@@ -14,7 +14,9 @@ interface ConsentRequest {
   id: number;
   tool: string;
   agent: string;
-  tab?: number;
+  tab?: number | null;
+  /// what the call is about when it isn't a tab (e.g. the saved host to open)
+  detail?: string | null;
 }
 
 interface Activity {
@@ -50,7 +52,11 @@ const AGENT_TOOLS = [
   ["scroll", "Scroll"],
   ["get_clipboard", "Get clipboard"],
   ["set_clipboard", "Set clipboard"],
+  ["list_tabs", "List tabs"],
+  ["switch_tab", "Switch target tab"],
+  ["list_saved_hosts", "List saved hosts"],
 ] as const;
+// open_saved_host is deliberately absent: the backend always asks for it
 
 export default function AgentPanel({ sessions, activeId }: AgentPanelProps) {
   const [open, setOpen] = useState(false);
@@ -106,6 +112,11 @@ export default function AgentPanel({ sessions, activeId }: AgentPanelProps) {
       }),
       listen<ConsentRequest>("agent-consent-request", (e) => {
         setPending((p) => [...p, e.payload]);
+      }),
+      // the agent retargeted itself (switch_tab / open_saved_host)
+      listen<{ id: number }>("agent-pinned", (e) => {
+        setPinned(e.payload.id);
+        setAcceptedBg(false);
       }),
     ];
     return () => subs.forEach((s) => s.then((f) => f()));
@@ -229,7 +240,8 @@ export default function AgentPanel({ sessions, activeId }: AgentPanelProps) {
             <h4>Target tab</h4>
             <p className="agent-hint">
               Which session the agent drives. Pin one, or follow whichever tab
-              you're viewing.
+              you're viewing. The agent can also switch this itself, and open
+              saved hosts (always with your approval).
             </p>
             <select
               className="agent-select"
@@ -338,7 +350,7 @@ export default function AgentPanel({ sessions, activeId }: AgentPanelProps) {
             <p className="modal-hint">
               <strong>{pending[0].agent}</strong> wants to call{" "}
               <code>{pending[0].tool}</code> on{" "}
-              <strong>{tabName(pending[0].tab)}</strong>
+              <strong>{pending[0].detail ?? tabName(pending[0].tab ?? undefined)}</strong>
               {pending[0].tab != null && pending[0].tab !== activeId
                 ? " — a tab you're not viewing"
                 : ""}

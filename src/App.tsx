@@ -296,6 +296,8 @@ export default function App() {
       listen<{ id: number; reason: string }>("rfb-disconnected", (e) => {
         const { id, reason } = e.payload;
         canvasRefs.current.delete(id);
+        // drop the dead handle so the Agent Bridge stops listing the tab
+        invoke("disconnect", { id }).catch(() => {});
         setSessions((ss) => {
           const gone = ss.find((s) => s.id === id);
           if (gone) {
@@ -316,6 +318,32 @@ export default function App() {
           });
           return next;
         });
+      }),
+      // the Agent Bridge opened a saved host in a background tab; the
+      // operator's current view stays put
+      listen<{
+        id: number;
+        info: ServerInfo;
+        host: string;
+        port: number;
+        username: string | null;
+      }>("agent-session-opened", (e) => {
+        const { id, info, host, port, username } = e.payload;
+        setSessions((ss) => [
+          ...ss,
+          {
+            id,
+            host,
+            port,
+            username,
+            name: info.name,
+            width: info.width,
+            height: info.height,
+            security: info.security,
+            encrypted: info.encrypted,
+          },
+        ]);
+        showToast(`Agent opened ${info.name || host}`);
       }),
       listen("rfb-cut-text", () => {
         showToast("Remote clipboard copied");

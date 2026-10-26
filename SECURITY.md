@@ -57,7 +57,14 @@ Required properties:
 - The MCP endpoint binds locally by default and must not be network-exposed by
   accident.
 - Bearer tokens stay out of renderer state whenever possible.
-- Tool calls are scoped to the active or explicitly pinned session.
+- Tool calls are scoped to the active or explicitly pinned session. The agent
+  may retarget among open tabs (`switch_tab`) without moving the operator's
+  view, and may open a new tab only to an operator-saved host
+  (`open_saved_host`). Opening is ask-only in every consent mode, and stored
+  credentials go from the OS credential store to the handshake without
+  reaching the agent or the renderer.
+- An agent-initiated retarget clears any background-tab acknowledgement; the
+  operator re-accepts for the new target.
 - Ask-every-call is the default consent mode.
 - Allow-list and autonomous modes are explicit operator choices, scoped to the
   current session posture.

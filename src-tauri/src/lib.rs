@@ -16,11 +16,21 @@ struct AppState(Mutex<AppInner>);
 #[derive(Default)]
 struct AppInner {
     sessions: HashMap<u32, rfb::SessionHandle>,
+    /// What each tab is connected to, so the Agent Bridge can describe tabs.
+    tabs: HashMap<u32, TabMeta>,
     next_id: u32,
     /// The tab the operator is currently viewing (streams; others are paused).
     active: Option<u32>,
-    /// The tab the Agent Bridge acts on. Chosen explicitly by the operator.
+    /// The tab the Agent Bridge acts on. Set by the operator in the panel, or
+    /// by the agent itself via `switch_tab` / `open_saved_host` (the operator's
+    /// `active` view is never changed by the agent).
     pinned: Option<u32>,
+}
+
+struct TabMeta {
+    host: String,
+    port: u16,
+    name: String,
 }
 
 impl AppState {
@@ -57,6 +67,49 @@ impl AppState {
         Some((id, handle, background))
     }
 
+    /// Every open tab as the Agent Bridge reports it: no handles, no secrets.
+    fn tab_list(&self) -> Vec<serde_json::Value> {
+        let inner = self.0.lock().unwrap();
+        let target = inner.pinned.or(inner.active);
+        let mut ids: Vec<u32> = inner.sessions.keys().copied().collect();
+        ids.sort();
+        ids.into_iter()
+            .filter_map(|id| {
+                let m = inner.tabs.get(&id)?;
+                Some(serde_json::json!({
+                    "tab": id, "name": m.name, "host": m.host, "port": m.port,
+                    "viewing": inner.active == Some(id),
+                    "agent_target": target == Some(id),
+                }))
+            })
+            .collect()
+    }
+
+    /// The open tab already connected to `host:port`, if any.
+    fn find_tab(&self, host: &str, port: u16) -> Option<u32> {
+        let inner = self.0.lock().unwrap();
+        inner
+            .tabs
+            .iter()
+            .find(|(id, m)| m.host == host && m.port == port && inner.sessions.contains_key(id))
+            .map(|(id, _)| *id)
+    }
+
+    /// Whether `id` is open but not the tab the operator is viewing.
+    fn is_background(&self, id: u32) -> bool {
+        self.0.lock().unwrap().active != Some(id)
+    }
+
+    /// Set the Agent Bridge's target tab (the operator's view is untouched).
+    fn pin(&self, id: u32) -> Result<(), String> {
+        let mut inner = self.0.lock().unwrap();
+        if !inner.sessions.contains_key(&id) {
+            return Err(format!("tab {id} not found"));
+        }
+        inner.pinned = Some(id);
+        Ok(())
+    }
+
     /// A tab streams (keeps requesting updates) if it's the focused tab OR the
     /// pinned tab — so the agent always has a fresh framebuffer of its target,
     /// even when the operator is viewing a different tab. Every other tab is
@@ -86,6 +139,9 @@ async fn kick_streaming(state: &AppState) {
 
 // --- session lifecycle ------------------------------------------------------
 
+/// Open a session in a new tab. `focus` makes it the viewed tab; an unfocused
+/// tab (opened by the Agent Bridge) only takes focus when nothing else is open.
+#[allow(clippy::too_many_arguments)]
 async fn open_session(
     app: tauri::AppHandle,
     state: &AppState,
@@ -94,6 +150,7 @@ async fn open_session(
     port: u16,
     username: Option<String>,
     password: Option<String>,
+    focus: bool,
 ) -> Result<serde_json::Value, String> {
     let id = {
         let mut inner = state.0.lock().unwrap();
@@ -101,13 +158,23 @@ async fn open_session(
         inner.next_id
     };
     let frames = channel.clone();
-    let (handle, info) = rfb::connect(app, frames, id, host, port, username, password)
+    let (handle, info) = rfb::connect(app, frames, id, host.clone(), port, username, password)
         .await
         .map_err(|e| e.to_string())?;
     {
         let mut inner = state.0.lock().unwrap();
         inner.sessions.insert(id, handle);
-        inner.active = Some(id); // opening a tab focuses it
+        inner.tabs.insert(
+            id,
+            TabMeta {
+                host,
+                port,
+                name: info.name.clone(),
+            },
+        );
+        if focus || inner.active.is_none() {
+            inner.active = Some(id);
+        }
     }
     // the new tab (and any pinned tab) streams; everything else pauses
     kick_streaming(state).await;
@@ -133,6 +200,7 @@ async fn connect(
         port,
         username,
         password,
+        true,
     )
     .await
 }
@@ -157,6 +225,7 @@ async fn connect_stored(
         port,
         username,
         password,
+        true,
     )
     .await
 }
@@ -167,6 +236,7 @@ async fn disconnect(state: State<'_, AppState>, id: u32) -> Result<(), String> {
     let (removed, new_active) = {
         let mut inner = state.0.lock().unwrap();
         let removed = inner.sessions.remove(&id);
+        inner.tabs.remove(&id);
         if inner.pinned == Some(id) {
             inner.pinned = None;
         }
