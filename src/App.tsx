@@ -753,36 +753,43 @@ export default function App() {
             </button>
           )}
         </div>
-        {activeSession && !showForm && (
-          <div className="toolbar-right">
-            <SecurityBadge session={activeSession} />
-            <button className="btn" onClick={typeClipboard} title="Ctrl+Shift+V">
-              Paste as keystrokes
-            </button>
-            <button
-              className="btn"
-              onClick={() => {
-                setPasteText("");
-                setPasteOpen(true);
-              }}
-              title="Type arbitrary text without touching the clipboard"
-            >
-              Type text...
-            </button>
-            <button className="btn" onClick={sendCtrlAltDel}>
-              Ctrl+Alt+Del
-            </button>
-            <AgentPanel
-              sessions={sessions}
-              activeId={activeId}
-              pinned={agentPinned}
-              onPinChange={changeAgentPin}
-            />
+        {/* The Agent Bridge stays mounted on every screen: it owns the consent
+            prompts, and an agent can call tools (open_saved_host) before any
+            session exists. Unmounted, its requests would time out unseen. */}
+        <div className="toolbar-right">
+          {activeSession && !showForm && (
+            <>
+              <SecurityBadge session={activeSession} />
+              <button className="btn" onClick={typeClipboard} title="Ctrl+Shift+V">
+                Paste as keystrokes
+              </button>
+              <button
+                className="btn"
+                onClick={() => {
+                  setPasteText("");
+                  setPasteOpen(true);
+                }}
+                title="Type arbitrary text without touching the clipboard"
+              >
+                Type text...
+              </button>
+              <button className="btn" onClick={sendCtrlAltDel}>
+                Ctrl+Alt+Del
+              </button>
+            </>
+          )}
+          <AgentPanel
+            sessions={sessions}
+            activeId={activeId}
+            pinned={agentPinned}
+            onPinChange={changeAgentPin}
+          />
+          {activeSession && !showForm && (
             <button className="btn btn-danger" onClick={() => closeTab(activeSession.id)}>
               Disconnect
             </button>
-          </div>
-        )}
+          )}
+        </div>
       </header>
 
       <main className="viewport" onContextMenu={(e) => e.preventDefault()}>
