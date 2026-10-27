@@ -85,14 +85,24 @@ impl AppState {
             .collect()
     }
 
-    /// The open tab already connected to `host:port`, if any.
+    /// The open tab already connected to `host:port`, if any (hostnames
+    /// compare case-insensitively; the oldest tab wins if there are several).
     fn find_tab(&self, host: &str, port: u16) -> Option<u32> {
         let inner = self.0.lock().unwrap();
         inner
             .tabs
             .iter()
-            .find(|(id, m)| m.host == host && m.port == port && inner.sessions.contains_key(id))
+            .filter(|(id, m)| {
+                m.host.eq_ignore_ascii_case(host)
+                    && m.port == port
+                    && inner.sessions.contains_key(id)
+            })
             .map(|(id, _)| *id)
+            .min()
+    }
+
+    fn has_tab(&self, id: u32) -> bool {
+        self.0.lock().unwrap().sessions.contains_key(&id)
     }
 
     /// Whether `id` is open but not the tab the operator is viewing.
@@ -139,8 +149,16 @@ async fn kick_streaming(state: &AppState) {
 
 // --- session lifecycle ------------------------------------------------------
 
-/// Open a session in a new tab. `focus` makes it the viewed tab; an unfocused
-/// tab (opened by the Agent Bridge) only takes focus when nothing else is open.
+/// Who opened a session. The operator's new tab takes focus; the Agent
+/// Bridge's becomes its pinned target and leaves the operator's view alone
+/// (it only takes focus when nothing else is open).
+#[derive(Clone, Copy)]
+enum Opener {
+    Operator,
+    Agent,
+}
+
+/// Open a session in a new tab.
 #[allow(clippy::too_many_arguments)]
 async fn open_session(
     app: tauri::AppHandle,
@@ -150,7 +168,7 @@ async fn open_session(
     port: u16,
     username: Option<String>,
     password: Option<String>,
-    focus: bool,
+    opener: Opener,
 ) -> Result<serde_json::Value, String> {
     let id = {
         let mut inner = state.0.lock().unwrap();
@@ -172,13 +190,35 @@ async fn open_session(
                 name: info.name.clone(),
             },
         );
-        if focus || inner.active.is_none() {
-            inner.active = Some(id);
+        match opener {
+            Opener::Operator => inner.active = Some(id),
+            Opener::Agent => {
+                inner.pinned = Some(id);
+                if inner.active.is_none() {
+                    inner.active = Some(id);
+                }
+            }
         }
     }
     // the new tab (and any pinned tab) streams; everything else pauses
     kick_streaming(state).await;
     Ok(serde_json::json!({ "id": id, "info": info }))
+}
+
+/// Open a session with the password the OS credential store holds for
+/// `host:port`, if any. The secret goes straight into the RFB handshake —
+/// never to renderer JavaScript or an Agent Bridge caller.
+async fn open_stored_session(
+    app: tauri::AppHandle,
+    state: &AppState,
+    channel: &frames::FrameChannel,
+    host: String,
+    port: u16,
+    username: Option<String>,
+    opener: Opener,
+) -> Result<serde_json::Value, String> {
+    let password = host_secret_entry(&host, port).and_then(|e| e.get_password().ok());
+    open_session(app, state, channel, host, port, username, password, opener).await
 }
 
 /// Open a new session in its own tab. Returns `{ id, info }`.
@@ -200,7 +240,7 @@ async fn connect(
         port,
         username,
         password,
-        true,
+        Opener::Operator,
     )
     .await
 }
@@ -216,16 +256,14 @@ async fn connect_stored(
     port: u16,
     username: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let password = host_secret_entry(&host, port).and_then(|e| e.get_password().ok());
-    open_session(
+    open_stored_session(
         app,
         state.inner(),
         channel.inner(),
         host,
         port,
         username,
-        password,
-        true,
+        Opener::Operator,
     )
     .await
 }
@@ -233,7 +271,7 @@ async fn connect_stored(
 /// Close one tab's session.
 #[tauri::command]
 async fn disconnect(state: State<'_, AppState>, id: u32) -> Result<(), String> {
-    let (removed, new_active) = {
+    let removed = {
         let mut inner = state.0.lock().unwrap();
         let removed = inner.sessions.remove(&id);
         inner.tabs.remove(&id);
@@ -241,15 +279,17 @@ async fn disconnect(state: State<'_, AppState>, id: u32) -> Result<(), String> {
             inner.pinned = None;
         }
         if inner.active == Some(id) {
-            inner.active = inner.sessions.keys().next().copied();
+            // The webview decides which tab to show next and calls set_active.
+            // Guessing here could leave the backend believing the operator
+            // views a different tab than the one on screen.
+            inner.active = None;
         }
-        (removed, inner.active)
+        removed
     };
-    let _ = new_active;
     if let Some(h) = removed {
         h.shutdown().await;
     }
-    // a promoted focused tab (and any pinned tab) resumes streaming
+    // any pinned tab keeps streaming; the next focused tab resumes via set_active
     kick_streaming(&state).await;
     Ok(())
 }
@@ -273,13 +313,22 @@ async fn set_active(state: State<'_, AppState>, id: u32) -> Result<(), String> {
 /// keeps streaming even when the operator views another tab, so the agent's
 /// screenshots stay current.
 #[tauri::command]
-async fn set_pinned(state: State<'_, AppState>, id: Option<u32>) -> Result<(), String> {
-    {
+async fn set_pinned(
+    state: State<'_, AppState>,
+    bridge: State<'_, agent::AgentBridge>,
+    id: Option<u32>,
+) -> Result<(), String> {
+    let changed = {
         let mut inner = state.0.lock().unwrap();
-        inner.pinned = match id {
+        let next = match id {
             Some(i) if inner.sessions.contains_key(&i) => Some(i),
             _ => None,
         };
+        std::mem::replace(&mut inner.pinned, next) != next
+    };
+    // an acknowledgement given for one background tab never carries over
+    if changed {
+        bridge.clear_background_ack();
     }
     kick_streaming(&state).await;
     Ok(())

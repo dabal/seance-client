@@ -60,12 +60,13 @@ Required properties:
 - Tool calls are scoped to the active or explicitly pinned session. The agent
   may retarget among open tabs (`switch_tab`) without moving the operator's
   view, and may open a new tab only to an operator-saved host
-  (`open_saved_host`). Opening follows the consent policy like any other tool
-  (it auto-approves in autonomous mode or when allow-listed), and stored
+  (`open_saved_host`). Both retarget tools override the operator's chosen
+  tab, so they auto-approve (autonomous or allow-listed) only when the
+  operator set the target to "Any tab"; otherwise each call asks. Stored
   credentials go from the OS credential store to the handshake without
   reaching the agent or the renderer.
-- An agent-initiated retarget clears any background-tab acknowledgement; the
-  operator re-accepts for the new target.
+- Any retarget, by the agent or the operator, clears the 15-minute
+  background-tab acknowledgement; it is re-accepted for the new target.
 - Ask-every-call is the default consent mode.
 - Allow-list and autonomous modes are explicit operator choices, scoped to the
   current session posture.

@@ -231,6 +231,18 @@ export default function App() {
   }, []);
 
   const canvasRefs = useRef<Map<number, HTMLCanvasElement>>(new Map());
+  // Tabs whose connection dropped before the tab was added: the drop event
+  // can beat the connect result. Ids are never reused, so such a tab is
+  // refused (and its backend handle released) instead of lingering dead.
+  const droppedIds = useRef<Set<number>>(new Set());
+  const addSession = useCallback((s: Session) => {
+    if (droppedIds.current.has(s.id)) {
+      invoke("disconnect", { id: s.id }).catch(() => {});
+      return false;
+    }
+    setSessions((ss) => [...ss, s]);
+    return true;
+  }, []);
   const activeIdRef = useRef<number | null>(null);
   activeIdRef.current = activeId;
   const pasteOpenRef = useRef(pasteOpen);
@@ -299,6 +311,7 @@ export default function App() {
     const subs: Promise<UnlistenFn>[] = [
       listen<{ id: number; reason: string }>("rfb-disconnected", (e) => {
         const { id, reason } = e.payload;
+        droppedIds.current.add(id);
         canvasRefs.current.delete(id);
         // drop the dead handle so the Agent Bridge stops listing the tab
         invoke("disconnect", { id }).catch(() => {});
@@ -333,21 +346,18 @@ export default function App() {
         username: string | null;
       }>("agent-session-opened", (e) => {
         const { id, info, host, port, username } = e.payload;
-        setSessions((ss) => [
-          ...ss,
-          {
-            id,
-            host,
-            port,
-            username,
-            name: info.name,
-            width: info.width,
-            height: info.height,
-            security: info.security,
-            encrypted: info.encrypted,
-          },
-        ]);
-        showToast(`Agent opened ${info.name || host}`);
+        const added = addSession({
+          id,
+          host,
+          port,
+          username,
+          name: info.name,
+          width: info.width,
+          height: info.height,
+          security: info.security,
+          encrypted: info.encrypted,
+        });
+        if (added) showToast(`Agent opened ${info.name || host}`);
       }),
       // the agent retargeted itself (switch_tab / open_saved_host)
       listen<{ id: number }>("agent-pinned", (e) => {
@@ -358,7 +368,7 @@ export default function App() {
       }),
     ];
     return () => subs.forEach((s) => s.then((f) => f()));
-  }, [showToast]);
+  }, [showToast, addSession]);
 
   const doConnect = useCallback(
     async (
@@ -390,7 +400,7 @@ export default function App() {
           security: res.info.security,
           encrypted: res.info.encrypted,
         };
-        setSessions((ss) => [...ss, s]);
+        if (!addSession(s)) throw new Error("connection closed by the host");
         setActiveId(res.id);
         setAdding(false);
         setConnecting(false);
@@ -418,7 +428,7 @@ export default function App() {
         showToast(String(err)); // visible even when the lobby form isn't
       }
     },
-    [showToast],
+    [showToast, addSession],
   );
 
   const connectSaved = useCallback(
@@ -447,7 +457,7 @@ export default function App() {
             security: res.info.security,
             encrypted: res.info.encrypted,
           };
-          setSessions((ss) => [...ss, session]);
+          if (!addSession(session)) throw new Error("connection closed by the host");
           setActiveId(res.id);
           setAdding(false);
           setConnecting(false);
@@ -464,7 +474,7 @@ export default function App() {
       setPassword("");
       doConnect(s.host, String(s.port), s.username ?? "", pw, false);
     },
-    [password, doConnect, showToast],
+    [password, doConnect, showToast, addSession],
   );
 
   const deleteSaved = useCallback((s: SavedHost) => {
@@ -553,7 +563,7 @@ export default function App() {
         security: res.info.security,
         encrypted: res.info.encrypted,
       };
-      setSessions((ss) => [...ss, session]);
+      if (!addSession(session)) throw new Error("connection closed by the host");
       setActiveId(res.id);
       setAdding(false);
       setConnecting(false);
@@ -562,7 +572,7 @@ export default function App() {
       setError(String(err));
       showToast(String(err));
     }
-  }, [dropped, showToast]);
+  }, [dropped, showToast, addSession]);
 
   // once a session's canvas mounts, size it and request a full repaint
   useEffect(() => {

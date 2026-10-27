@@ -146,6 +146,9 @@ struct Inner {
     /// Operator setting: auto-approval also covers tabs they aren't viewing —
     /// no expiry, survives agent retargets. Session-only, like autonomous.
     bg_all: AtomicBool,
+    /// Serializes `open_saved_host`, so two concurrent calls for one host share
+    /// a tab instead of both opening a connection.
+    open_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -184,6 +187,7 @@ impl AgentBridge {
             rate: Mutex::new(RateLimit::default()),
             bg_ack_until: Mutex::new(None),
             bg_all: AtomicBool::new(false),
+            open_lock: tokio::sync::Mutex::new(()),
         }));
 
         // dev affordance: surface the local endpoint + token so a developer can
@@ -280,6 +284,12 @@ impl AgentBridge {
 
     pub fn background_autonomy(&self) -> bool {
         self.0.bg_all.load(Ordering::SeqCst)
+    }
+
+    /// Drop any background acknowledgement: it was given for one target tab
+    /// and never carries over to another.
+    pub fn clear_background_ack(&self) {
+        *self.0.bg_ack_until.lock().unwrap() = None;
     }
 
     fn bg_ack_valid(&self) -> bool {
@@ -414,33 +424,23 @@ impl AgentBridge {
             };
             (Some(tab), Some(session), background)
         };
+        // A switch to a tab that isn't open fails now, not after a prompt.
+        if name == "switch_tab" && !tab.is_some_and(|t| state.has_tab(t)) {
+            return self.reject(
+                &agent,
+                name,
+                &args,
+                "switch_tab requires the `tab` id of an open tab (see list_tabs)",
+            );
+        }
         // Resolve the saved host *before* consent, so the operator approves the
         // actual address rather than whatever string the agent sent.
         let saved = if name == "open_saved_host" {
             let hosts = crate::settings::load(&self.0.app).hosts;
-            match find_saved_host(
-                &hosts,
-                arg_str(&args, "name"),
-                args.get("group").and_then(|g| g.as_str()),
-            ) {
+            let group = Some(arg_str(&args, "group")).filter(|g| !g.is_empty());
+            match find_saved_host(&hosts, arg_str(&args, "name"), group) {
                 Ok(h) => Some(h.clone()),
-                Err(e) => {
-                    self.audit(
-                        &agent,
-                        name,
-                        &args,
-                        tab,
-                        background,
-                        "rejected",
-                        &format!("error: {e}"),
-                        None,
-                    );
-                    let _ = self.0.app.emit(
-                        "agent-activity",
-                        json!({ "phase": "error", "tool": name, "error": e, "ts": now_ms() }),
-                    );
-                    return tool_error(&e);
-                }
+                Err(e) => return self.reject(&agent, name, &args, &e),
             }
         } else {
             None
@@ -518,6 +518,26 @@ impl AgentBridge {
         }
     }
 
+    /// Refuse a call that can't be valid before asking the operator about it.
+    /// Audited as `rejected`, with no tab, since none was resolved.
+    fn reject(&self, agent: &str, tool: &str, args: &Value, error: &str) -> Value {
+        self.audit(
+            agent,
+            tool,
+            args,
+            None,
+            false,
+            "rejected",
+            &format!("error: {error}"),
+            None,
+        );
+        let _ = self.0.app.emit(
+            "agent-activity",
+            json!({ "phase": "error", "tool": tool, "error": error, "ts": now_ms() }),
+        );
+        tool_error(error)
+    }
+
     async fn decide(
         &self,
         tool: &str,
@@ -525,6 +545,11 @@ impl AgentBridge {
         background: bool,
         detail: Option<&str>,
     ) -> bool {
+        // Retargeting overrides the tab the operator chose. Only "Any tab"
+        // hands that choice to the agent; otherwise every retarget is asked.
+        if RETARGET_TOOLS.contains(&tool) && !self.background_autonomy() {
+            return self.ask(tool, tab, detail).await;
+        }
         let auto = match &*self.0.consent.lock().unwrap() {
             ConsentMode::Autonomous => true,
             ConsentMode::AllowList(set) => set.contains(tool),
@@ -570,7 +595,6 @@ impl AgentBridge {
         let clamp_x = |v: i64| v.clamp(0, fbw.saturating_sub(1) as i64) as u16;
         let clamp_y = |v: i64| v.clamp(0, fbh.saturating_sub(1) as i64) as u16;
         let arg_i = |k: &str| args.get(k).and_then(|v| v.as_i64());
-        let arg_s = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("");
 
         match name {
             "screenshot" => {
@@ -581,7 +605,7 @@ impl AgentBridge {
                 }))
             }
             "type_text" => {
-                let text = arg_s("text");
+                let text = arg_str(args, "text");
                 session.type_text(text).await.map_err(|e| e.to_string())?;
                 Ok(tool_ok(&format!(
                     "typed {} characters",
@@ -631,7 +655,7 @@ impl AgentBridge {
                     clamp_x(arg_i("x").unwrap_or(0)),
                     clamp_y(arg_i("y").unwrap_or(0)),
                 );
-                let mask = match arg_s("button") {
+                let mask = match arg_str(args, "button") {
                     "right" => 4u8,
                     "middle" => 2u8,
                     _ => 1u8,
@@ -666,7 +690,7 @@ impl AgentBridge {
                     clamp_x(arg_i("x").unwrap_or(0)),
                     clamp_y(arg_i("y").unwrap_or(0)),
                 );
-                let bit = if arg_s("direction") == "up" {
+                let bit = if arg_str(args, "direction") == "up" {
                     8u8
                 } else {
                     16u8
@@ -682,11 +706,11 @@ impl AgentBridge {
                         .await
                         .map_err(|e| e.to_string())?;
                 }
-                Ok(tool_ok(&format!("scrolled {}", arg_s("direction"))))
+                Ok(tool_ok(&format!("scrolled {}", arg_str(args, "direction"))))
             }
             "get_clipboard" => Ok(tool_ok(&session.remote_clipboard())),
             "set_clipboard" => {
-                let text = arg_s("text");
+                let text = arg_str(args, "text");
                 session
                     .set_remote_clipboard(text)
                     .await
@@ -735,6 +759,7 @@ impl AgentBridge {
             }
             "open_saved_host" => {
                 let saved = saved.ok_or("saved host was not resolved")?;
+                let _serial = self.0.open_lock.lock().await;
                 if let Some(tab) = state.find_tab(&saved.host, saved.port) {
                     state.pin(tab)?;
                     self.retargeted(tab);
@@ -747,24 +772,19 @@ impl AgentBridge {
                         Some(tab),
                     ));
                 }
-                // The stored password goes from the OS credential store straight
-                // into the RFB handshake — never to the agent or the renderer.
-                let password = crate::host_secret_entry(&saved.host, saved.port)
-                    .and_then(|e| e.get_password().ok());
+                // opened as the agent's pinned target, streaming from the start
                 let channel = app.state::<crate::frames::FrameChannel>();
-                let opened = crate::open_session(
+                let opened = crate::open_stored_session(
                     app.clone(),
                     &state,
                     &channel,
                     saved.host.clone(),
                     saved.port,
                     saved.username.clone(),
-                    password,
-                    false,
+                    crate::Opener::Agent,
                 )
                 .await?;
                 let tab = opened["id"].as_u64().ok_or("connect returned no tab id")? as u32;
-                state.pin(tab)?;
                 // the webview adds the tab before it learns the new pin
                 let _ = app.emit(
                     "agent-session-opened",
@@ -772,7 +792,6 @@ impl AgentBridge {
                             "port": saved.port, "username": saved.username }),
                 );
                 self.retargeted(tab);
-                crate::kick_streaming(&state).await;
                 Ok((
                     tool_ok(&format!(
                         "opened {} as tab {tab}; agent now targets it",
@@ -788,7 +807,7 @@ impl AgentBridge {
     /// The agent moved its own target: tell the panel, and drop any background
     /// acknowledgement — the operator gave it for a different tab.
     fn retargeted(&self, tab: u32) {
-        *self.0.bg_ack_until.lock().unwrap() = None;
+        self.clear_background_ack();
         let _ = self.0.app.emit("agent-pinned", json!({ "id": tab }));
     }
 
@@ -957,6 +976,9 @@ fn tool_specs() -> Value {
         }
     ])
 }
+
+/// Tools that move the agent's target. Auto-approved only under "Any tab".
+const RETARGET_TOOLS: &[&str] = &["switch_tab", "open_saved_host"];
 
 /// Tools that manage tab targeting instead of acting on the target session.
 fn is_tab_tool(name: &str) -> bool {
@@ -1200,6 +1222,23 @@ mod tests {
             "10.0.0.3"
         );
         assert!(find_saved_host(&hosts, "nope", None).is_err());
+    }
+
+    #[test]
+    fn retarget_tools_are_the_tab_moving_tools() {
+        for t in RETARGET_TOOLS {
+            assert!(is_tab_tool(t));
+        }
+        assert!(!RETARGET_TOOLS.contains(&"list_tabs"));
+        assert!(!RETARGET_TOOLS.contains(&"list_saved_hosts"));
+    }
+
+    #[test]
+    fn arg_str_defaults_to_empty() {
+        let args = json!({ "name": "gpdc01", "n": 3 });
+        assert_eq!(arg_str(&args, "name"), "gpdc01");
+        assert_eq!(arg_str(&args, "n"), "");
+        assert_eq!(arg_str(&args, "missing"), "");
     }
 
     #[test]
